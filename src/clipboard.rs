@@ -96,13 +96,22 @@ impl LinuxClipboard {
     }
 
     fn get_text(&self) -> Result<String, std::io::Error> {
-        let output = std::process::Command::new("wl-paste")
-            .args(["-n", "--type", "text/plain;charset=utf-8"])
-            .output()?;
-        if !output.status.success() {
-            return Ok(String::new());
+        let attempts = [
+            ["-n", "--type", "text/plain;charset=utf-8"].as_slice(),
+            ["-n", "--type", "text/plain"].as_slice(),
+            ["-n"].as_slice(),
+        ];
+        for args in attempts {
+            let output = std::process::Command::new("wl-paste").args(args).output()?;
+            if !output.status.success() {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&output.stdout).to_string();
+            if !text.is_empty() {
+                return Ok(text);
+            }
         }
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok(String::new())
     }
 
     fn set_text(&self, text: &str) -> Result<(), std::io::Error> {
