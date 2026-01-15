@@ -240,7 +240,7 @@ impl Service {
                     .is_none_or(|t| t.elapsed() >= LOG_INTERVAL);
                 if log_now {
                     self.clipboard_error_at = Some(Instant::now());
-                    log::warn!("clipboard read failed: {e}");
+                    log::debug!("clipboard read failed: {e}");
                 }
             }
         }

@@ -335,11 +335,16 @@ impl CaptureTask {
                         self.set_invert_scroll(h, invert);
                     }
                     CaptureRequest::SendClipboard(text) => {
-                        if let Some(handle) = self.active_client {
-                            if self.state == State::Sending {
-                                if let Err(e) = self.conn.send(ProtoEvent::ClipboardText(text), handle).await {
-                                    log::warn!("clipboard send failed: {e}");
-                                }
+                        for &(handle, _pos, capture_type) in &self.captures {
+                            if capture_type != CaptureType::Default {
+                                continue;
+                            }
+                            if let Err(e) = self
+                                .conn
+                                .send(ProtoEvent::ClipboardText(text.clone()), handle)
+                                .await
+                            {
+                                log::warn!("clipboard send failed: {e}");
                             }
                         }
                     }
