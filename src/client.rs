@@ -221,6 +221,13 @@ impl ClientManager {
             .and_then(|(c, _)| c.cmd.clone())
     }
 
+    pub(crate) fn get_invert_scroll(&self, handle: ClientHandle) -> Option<bool> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .map(|(c, _)| c.invert_scroll)
+    }
+
     /// returns all clients that are currently active
     pub(crate) fn active_clients(&self) -> Vec<ClientHandle> {
         self.clients

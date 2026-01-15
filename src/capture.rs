@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -8,7 +9,7 @@ use futures::StreamExt;
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
-use input_event::scancode;
+use input_event::{Event, PointerEvent, scancode};
 use lan_mouse_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
@@ -57,6 +58,8 @@ enum CaptureRequest {
     Create(CaptureHandle, Position, CaptureType),
     /// destory a capture client
     Destroy(CaptureHandle),
+    /// update scroll inversion per client
+    SetInvertScroll(CaptureHandle, bool),
     /// reenable input capture
     Reenable,
 }
@@ -75,6 +78,7 @@ impl Capture {
             backend,
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
+            invert_scroll: Default::default(),
             conn,
             event_tx,
             request_rx,
@@ -122,6 +126,12 @@ impl Capture {
             .expect("channel closed");
     }
 
+    pub(crate) fn set_invert_scroll(&self, handle: CaptureHandle, invert: bool) {
+        self.request_tx
+            .send(CaptureRequest::SetInvertScroll(handle, invert))
+            .expect("channel closed");
+    }
+
     pub(crate) fn release(&self) {
         self.request_tx
             .send(CaptureRequest::Release)
@@ -155,6 +165,7 @@ struct CaptureTask {
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
+    invert_scroll: HashMap<CaptureHandle, bool>,
     conn: LanMouseConnection,
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
@@ -169,6 +180,19 @@ impl CaptureTask {
 
     fn remove_capture(&mut self, handle: CaptureHandle) {
         self.captures.retain(|&(h, ..)| handle != h);
+        self.invert_scroll.remove(&handle);
+    }
+
+    fn set_invert_scroll(&mut self, handle: CaptureHandle, invert: bool) {
+        self.invert_scroll.insert(handle, invert);
+    }
+
+    fn should_invert_scroll(&self, handle: CaptureHandle) -> bool {
+        self.invert_scroll.get(&handle).copied().unwrap_or(false)
+    }
+
+    fn invert_scroll_event(&self, handle: CaptureHandle, event: CaptureEvent) -> CaptureEvent {
+        invert_scroll_event(event, self.should_invert_scroll(handle))
     }
 
     fn is_default_capture_at(&self, pos: Position) -> bool {
@@ -204,6 +228,9 @@ impl CaptureTask {
                         CaptureRequest::Reenable => break,
                         CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
+                        CaptureRequest::SetInvertScroll(h, invert) => {
+                            self.set_invert_scroll(h, invert);
+                        }
                         CaptureRequest::Release => { /* nothing to do */ }
                     },
                     _ = self.cancellation_token.cancelled() => return,
@@ -295,6 +322,9 @@ impl CaptureTask {
                         self.remove_capture(h);
                         capture.destroy(h).await?;
                     }
+                    CaptureRequest::SetInvertScroll(h, invert) => {
+                        self.set_invert_scroll(h, invert);
+                    }
                 },
                 _ = self.cancellation_token.cancelled() => break,
             }
@@ -309,6 +339,8 @@ impl CaptureTask {
     ) -> Result<(), CaptureError> {
         let (handle, event) = event;
         log::trace!("({handle}): {event:?}");
+
+        let event = self.invert_scroll_event(handle, event);
 
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
@@ -393,6 +425,93 @@ fn to_proto_pos(pos: input_capture::Position) -> lan_mouse_proto::Position {
         input_capture::Position::Right => lan_mouse_proto::Position::Right,
         input_capture::Position::Top => lan_mouse_proto::Position::Top,
         input_capture::Position::Bottom => lan_mouse_proto::Position::Bottom,
+    }
+}
+
+fn invert_scroll_event(event: CaptureEvent, invert: bool) -> CaptureEvent {
+    if !invert {
+        return event;
+    }
+    match event {
+        CaptureEvent::Input(Event::Pointer(PointerEvent::Axis { time, axis, value })) => {
+            CaptureEvent::Input(Event::Pointer(PointerEvent::Axis {
+                time,
+                axis,
+                value: -value,
+            }))
+        }
+        CaptureEvent::Input(Event::Pointer(PointerEvent::AxisDiscrete120 { axis, value })) => {
+            CaptureEvent::Input(Event::Pointer(PointerEvent::AxisDiscrete120 {
+                axis,
+                value: -value,
+            }))
+        }
+        _ => event,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use input_event::{Event, PointerEvent};
+
+    #[test]
+    fn invert_scroll_event_flips_axis_values() {
+        let event = CaptureEvent::Input(Event::Pointer(PointerEvent::Axis {
+            time: 0,
+            axis: 0,
+            value: 10.5,
+        }));
+        match invert_scroll_event(event, true) {
+            CaptureEvent::Input(Event::Pointer(PointerEvent::Axis { value, .. })) => {
+                assert_eq!(value, -10.5);
+            }
+            _ => panic!("unexpected event type"),
+        }
+    }
+
+    #[test]
+    fn invert_scroll_event_flips_discrete_values() {
+        let event = CaptureEvent::Input(Event::Pointer(PointerEvent::AxisDiscrete120 {
+            axis: 1,
+            value: 120,
+        }));
+        match invert_scroll_event(event, true) {
+            CaptureEvent::Input(Event::Pointer(PointerEvent::AxisDiscrete120 { value, .. })) => {
+                assert_eq!(value, -120);
+            }
+            _ => panic!("unexpected event type"),
+        }
+    }
+
+    #[test]
+    fn invert_scroll_event_leaves_other_events_untouched() {
+        let event = CaptureEvent::Input(Event::Pointer(PointerEvent::Button {
+            time: 0,
+            button: 1,
+            state: 1,
+        }));
+        match invert_scroll_event(event, true) {
+            CaptureEvent::Input(Event::Pointer(PointerEvent::Button { state, .. })) => {
+                assert_eq!(state, 1);
+            }
+            _ => panic!("unexpected event type"),
+        }
+    }
+
+    #[test]
+    fn invert_scroll_event_noop_when_disabled() {
+        let event = CaptureEvent::Input(Event::Pointer(PointerEvent::Axis {
+            time: 0,
+            axis: 0,
+            value: -3.0,
+        }));
+        match invert_scroll_event(event, false) {
+            CaptureEvent::Input(Event::Pointer(PointerEvent::Axis { value, .. })) => {
+                assert_eq!(value, -3.0);
+            }
+            _ => panic!("unexpected event type"),
+        }
     }
 }
 

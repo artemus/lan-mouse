@@ -140,6 +140,8 @@ pub struct ClientConfig {
     pub pos: Position,
     /// enter hook
     pub cmd: Option<String>,
+    /// invert scroll direction for this client
+    pub invert_scroll: bool,
 }
 
 impl Default for ClientConfig {
@@ -150,6 +152,7 @@ impl Default for ClientConfig {
             fix_ips: Default::default(),
             pos: Default::default(),
             cmd: None,
+            invert_scroll: false,
         }
     }
 }

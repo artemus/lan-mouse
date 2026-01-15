@@ -64,6 +64,7 @@ struct TomlClient {
     position: Option<Position>,
     activate_on_startup: Option<bool>,
     enter_hook: Option<String>,
+    invert_scroll: Option<bool>,
 }
 
 impl ConfigToml {
@@ -253,6 +254,7 @@ pub struct ConfigClient {
     pub pos: Position,
     pub active: bool,
     pub enter_hook: Option<String>,
+    pub invert_scroll: bool,
 }
 
 impl From<TomlClient> for ConfigClient {
@@ -263,6 +265,7 @@ impl From<TomlClient> for ConfigClient {
         let ips = HashSet::from_iter(toml.ips.into_iter().flatten());
         let port = toml.port.unwrap_or(DEFAULT_PORT);
         let pos = toml.position.unwrap_or_default();
+        let invert_scroll = toml.invert_scroll.unwrap_or(false);
         Self {
             ips,
             hostname,
@@ -270,6 +273,7 @@ impl From<TomlClient> for ConfigClient {
             pos,
             active,
             enter_hook,
+            invert_scroll,
         }
     }
 }

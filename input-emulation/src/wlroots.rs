@@ -203,15 +203,14 @@ impl VirtualInput {
                     }
                     PointerEvent::Axis { time, axis, value } => {
                         let axis: Axis = (axis as u32).try_into()?;
+                        self.pointer.axis_source(AxisSource::Finger);
                         self.pointer.axis(time, axis, value);
-                        self.pointer.frame();
                     }
                     PointerEvent::AxisDiscrete120 { axis, value } => {
                         let axis: Axis = (axis as u32).try_into()?;
+                        self.pointer.axis_source(AxisSource::Wheel);
                         self.pointer
                             .axis_discrete(now, axis, value as f64 / 8., value / 120);
-                        self.pointer.axis_source(AxisSource::Wheel);
-                        self.pointer.frame();
                     }
                 }
                 self.pointer.frame();

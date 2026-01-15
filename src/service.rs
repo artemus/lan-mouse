@@ -87,6 +87,7 @@ impl Service {
                 port: client.port,
                 pos: client.pos,
                 cmd: client.enter_hook,
+                invert_scroll: client.invert_scroll,
             };
             let state = ClientState {
                 active: client.active,
@@ -445,6 +446,8 @@ impl Service {
         if self.client_manager.activate_client(handle) {
             /* notify capture and frontends */
             self.capture.create(handle, pos, CaptureType::Default);
+            let invert_scroll = self.client_manager.get_invert_scroll(handle).unwrap_or(false);
+            self.capture.set_invert_scroll(handle, invert_scroll);
             self.broadcast_client(handle);
             log::info!("activated client {handle} ({pos})");
         }
