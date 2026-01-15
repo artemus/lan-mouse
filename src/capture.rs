@@ -50,7 +50,7 @@ pub(crate) enum CaptureType {
     EnterOnly,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum CaptureRequest {
     /// capture must release the mouse
     Release,
@@ -60,6 +60,8 @@ enum CaptureRequest {
     Destroy(CaptureHandle),
     /// update scroll inversion per client
     SetInvertScroll(CaptureHandle, bool),
+    /// send clipboard text to the active client
+    SendClipboard(String),
     /// reenable input capture
     Reenable,
 }
@@ -135,6 +137,12 @@ impl Capture {
     pub(crate) fn release(&self) {
         self.request_tx
             .send(CaptureRequest::Release)
+            .expect("channel closed");
+    }
+
+    pub(crate) fn send_clipboard(&self, text: String) {
+        self.request_tx
+            .send(CaptureRequest::SendClipboard(text))
             .expect("channel closed");
     }
 
@@ -231,6 +239,7 @@ impl CaptureTask {
                         CaptureRequest::SetInvertScroll(h, invert) => {
                             self.set_invert_scroll(h, invert);
                         }
+                        CaptureRequest::SendClipboard(_) => { /* handled in active session */ }
                         CaptureRequest::Release => { /* nothing to do */ }
                     },
                     _ = self.cancellation_token.cancelled() => return,
@@ -324,6 +333,15 @@ impl CaptureTask {
                     }
                     CaptureRequest::SetInvertScroll(h, invert) => {
                         self.set_invert_scroll(h, invert);
+                    }
+                    CaptureRequest::SendClipboard(text) => {
+                        if let Some(handle) = self.active_client {
+                            if self.state == State::Sending {
+                                if let Err(e) = self.conn.send(ProtoEvent::ClipboardText(text), handle).await {
+                                    log::warn!("clipboard send failed: {e}");
+                                }
+                            }
+                        }
                     }
                 },
                 _ = self.cancellation_token.cancelled() => break,

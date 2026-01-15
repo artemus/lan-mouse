@@ -7,10 +7,28 @@ use std::{
 };
 use thiserror::Error;
 
-/// defines the maximum size an encoded event can take up
+/// defines the maximum size an encoded input event can take up
 /// this is currently the pointer motion event
 /// type: u8, time: u32, dx: f64, dy: f64
-pub const MAX_EVENT_SIZE: usize = size_of::<u8>() + size_of::<u32>() + 2 * size_of::<f64>();
+const MAX_INPUT_EVENT_SIZE: usize =
+    size_of::<u8>() + size_of::<u32>() + 2 * size_of::<f64>();
+
+/// maximum clipboard payload size (text-only)
+pub const MAX_CLIPBOARD_BYTES: usize = 16 * 1024;
+
+const MAX_CLIPBOARD_EVENT_SIZE: usize =
+    size_of::<u8>() + size_of::<u32>() + MAX_CLIPBOARD_BYTES;
+
+const fn max_usize(a: usize, b: usize) -> usize {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+/// defines the maximum size an encoded event can take up
+pub const MAX_EVENT_SIZE: usize = max_usize(MAX_INPUT_EVENT_SIZE, MAX_CLIPBOARD_EVENT_SIZE);
 
 /// error type for protocol violations
 #[derive(Debug, Error)]
@@ -21,6 +39,12 @@ pub enum ProtocolError {
     /// position type does not exist
     #[error("invalid event id: `{0}`")]
     InvalidPosition(#[from] TryFromPrimitiveError<Position>),
+    /// clipboard payload too large or malformed
+    #[error("invalid clipboard length: `{0}`")]
+    InvalidClipboardLength(u32),
+    /// clipboard payload is not valid utf-8
+    #[error("invalid clipboard text: `{0}`")]
+    InvalidClipboardText(#[from] std::string::FromUtf8Error),
 }
 
 /// Position of a client
@@ -46,7 +70,7 @@ impl Display for Position {
 }
 
 /// main lan-mouse protocol event type
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum ProtoEvent {
     /// notify a client that the cursor entered its region at the given position
     /// [`ProtoEvent::Ack`] with the same serial is used for synchronization between devices
@@ -63,6 +87,8 @@ pub enum ProtoEvent {
     Ping,
     /// Response to [`ProtoEvent::Ping`], true if emulation is enabled / available
     Pong(bool),
+    /// Clipboard text sync (utf-8)
+    ClipboardText(String),
 }
 
 impl Display for ProtoEvent {
@@ -80,6 +106,7 @@ impl Display for ProtoEvent {
                     if *alive { "alive" } else { "not available" }
                 )
             }
+            ProtoEvent::ClipboardText(_) => write!(f, "clipboard-text"),
         }
     }
 }
@@ -98,6 +125,7 @@ pub enum EventType {
     Enter,
     Leave,
     Ack,
+    ClipboardText,
 }
 
 impl ProtoEvent {
@@ -120,6 +148,7 @@ impl ProtoEvent {
             ProtoEvent::Enter(_) => EventType::Enter,
             ProtoEvent::Leave(_) => EventType::Leave,
             ProtoEvent::Ack(_) => EventType::Ack,
+            ProtoEvent::ClipboardText(_) => EventType::ClipboardText,
         }
     }
 }
@@ -174,6 +203,15 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
             EventType::Enter => Ok(Self::Enter(decode_u8(&mut buf)?.try_into()?)),
             EventType::Leave => Ok(Self::Leave(decode_u32(&mut buf)?)),
             EventType::Ack => Ok(Self::Ack(decode_u32(&mut buf)?)),
+            EventType::ClipboardText => {
+                let len = decode_u32(&mut buf)?;
+                if len as usize > MAX_CLIPBOARD_BYTES {
+                    return Err(ProtocolError::InvalidClipboardLength(len));
+                }
+                let data = decode_bytes(&mut buf, len as usize)?;
+                let text = String::from_utf8(data)?;
+                Ok(Self::ClipboardText(text))
+            }
         }
     }
 }
@@ -238,6 +276,12 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                 ProtoEvent::Enter(pos) => encode_u8(buf, len, pos as u8),
                 ProtoEvent::Leave(serial) => encode_u32(buf, len, serial),
                 ProtoEvent::Ack(serial) => encode_u32(buf, len, serial),
+                ProtoEvent::ClipboardText(text) => {
+                    let bytes = text.as_bytes();
+                    let clipped_len = bytes.len().min(MAX_CLIPBOARD_BYTES);
+                    encode_u32(buf, len, clipped_len as u32);
+                    encode_bytes(buf, len, &bytes[..clipped_len]);
+                }
             }
         }
         (buf, len)
@@ -261,6 +305,15 @@ decode_impl!(u32);
 decode_impl!(i32);
 decode_impl!(f64);
 
+fn decode_bytes(data: &mut &[u8], len: usize) -> Result<Vec<u8>, ProtocolError> {
+    if data.len() < len {
+        return Err(ProtocolError::InvalidClipboardLength(len as u32));
+    }
+    let (bytes, rest) = data.split_at(len);
+    *data = rest;
+    Ok(bytes.to_vec())
+}
+
 macro_rules! encode_impl {
     ($t:ty) => {
         paste! {
@@ -280,3 +333,55 @@ encode_impl!(u8);
 encode_impl!(u32);
 encode_impl!(i32);
 encode_impl!(f64);
+
+fn encode_bytes(buf: &mut &mut [u8], amt: &mut usize, bytes: &[u8]) {
+    let data = std::mem::take(buf);
+    let (dst, rest) = data.split_at_mut(bytes.len());
+    dst.copy_from_slice(bytes);
+    *amt += bytes.len();
+    *buf = rest;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(event: ProtoEvent) -> Result<ProtoEvent, ProtocolError> {
+        let (buf, _len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+        ProtoEvent::try_from(buf)
+    }
+
+    #[test]
+    fn clipboard_text_roundtrip() {
+        let event = ProtoEvent::ClipboardText("hello".to_owned());
+        match roundtrip(event).unwrap() {
+            ProtoEvent::ClipboardText(text) => assert_eq!(text, "hello"),
+            _ => panic!("unexpected event"),
+        }
+    }
+
+    #[test]
+    fn clipboard_text_truncates_to_max() {
+        let text = "a".repeat(MAX_CLIPBOARD_BYTES + 10);
+        let event = ProtoEvent::ClipboardText(text.clone());
+        match roundtrip(event).unwrap() {
+            ProtoEvent::ClipboardText(received) => {
+                assert_eq!(received.len(), MAX_CLIPBOARD_BYTES);
+                assert_eq!(&received[..], &text[..MAX_CLIPBOARD_BYTES]);
+            }
+            _ => panic!("unexpected event"),
+        }
+    }
+
+    #[test]
+    fn clipboard_text_rejects_oversize_length() {
+        let mut buf = [0u8; MAX_EVENT_SIZE];
+        buf[0] = EventType::ClipboardText as u8;
+        let len = (MAX_CLIPBOARD_BYTES as u32) + 1;
+        buf[1..5].copy_from_slice(&len.to_be_bytes());
+        match ProtoEvent::try_from(buf) {
+            Err(ProtocolError::InvalidClipboardLength(n)) => assert_eq!(n, len),
+            _ => panic!("unexpected result"),
+        }
+    }
+}

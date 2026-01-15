@@ -50,6 +50,8 @@ pub(crate) enum EmulationEvent {
     EmulationDisabled,
     /// emulation was enabled
     EmulationEnabled,
+    /// clipboard text received
+    ClipboardText(String),
     /// capture should be released
     ReleaseNotify,
 }
@@ -149,6 +151,11 @@ impl ListenTask {
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                             }
                             ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
+                            ProtoEvent::ClipboardText(text) => {
+                                self.event_tx
+                                    .send(EmulationEvent::ClipboardText(text))
+                                    .expect("channel closed");
+                            }
                             ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
                             _ => {}
                         }

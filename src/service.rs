@@ -1,5 +1,6 @@
 use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
+    clipboard::ClipboardSync,
     client::ClientManager,
     config::Config,
     connect::LanMouseConnection,
@@ -14,12 +15,14 @@ use lan_mouse_ipc::{
     AsyncFrontendListener, ClientConfig, ClientHandle, ClientState, FrontendEvent, FrontendRequest,
     IpcError, IpcListenerCreationError, Position, Status,
 };
+use lan_mouse_proto::MAX_CLIPBOARD_BYTES;
 use log;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
     net::{IpAddr, SocketAddr},
     sync::{Arc, RwLock},
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::{process::Command, signal, sync::Notify};
@@ -68,6 +71,8 @@ pub struct Service {
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
+    clipboard: Option<ClipboardSync>,
+    clipboard_error_at: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -122,6 +127,13 @@ impl Service {
         let resolver = DnsResolver::new()?;
 
         let port = config.port();
+        let clipboard = match ClipboardSync::new() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                log::warn!("clipboard disabled: {e}");
+                None
+            }
+        };
         let service = Self {
             capture,
             emulation,
@@ -138,6 +150,8 @@ impl Service {
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
+            clipboard,
+            clipboard_error_at: None,
         };
         Ok(service)
     }
@@ -155,6 +169,7 @@ impl Service {
             self.activate_client(handle);
         }
 
+        let mut clipboard_tick = tokio::time::interval(Duration::from_millis(500));
         loop {
             tokio::select! {
                 request = self.frontend_listener.next() => self.handle_frontend_request(request),
@@ -162,6 +177,7 @@ impl Service {
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
+                _ = clipboard_tick.tick() => self.handle_clipboard_tick(),
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
         }
@@ -210,6 +226,26 @@ impl Service {
         }
     }
 
+    fn handle_clipboard_tick(&mut self) {
+        let Some(clipboard) = self.clipboard.as_mut() else {
+            return;
+        };
+        match clipboard.poll() {
+            Ok(Some(text)) => self.send_clipboard(text),
+            Ok(None) => {}
+            Err(e) => {
+                const LOG_INTERVAL: Duration = Duration::from_secs(5);
+                let log_now = self
+                    .clipboard_error_at
+                    .is_none_or(|t| t.elapsed() >= LOG_INTERVAL);
+                if log_now {
+                    self.clipboard_error_at = Some(Instant::now());
+                    log::warn!("clipboard read failed: {e}");
+                }
+            }
+        }
+    }
+
     fn handle_emulation_event(&mut self, event: EmulationEvent) {
         match event {
             EmulationEvent::ConnectionAttempt { fingerprint } => {
@@ -254,9 +290,31 @@ impl Service {
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
             EmulationEvent::ReleaseNotify => self.capture.release(),
+            EmulationEvent::ClipboardText(text) => self.handle_clipboard_text(text),
             EmulationEvent::Connected { addr, fingerprint } => {
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
+        }
+    }
+
+    fn send_clipboard(&self, text: String) {
+        if text.as_bytes().len() > MAX_CLIPBOARD_BYTES {
+            log::warn!("clipboard text too large, skipping");
+            return;
+        }
+        self.capture.send_clipboard(text);
+    }
+
+    fn handle_clipboard_text(&mut self, text: String) {
+        if text.as_bytes().len() > MAX_CLIPBOARD_BYTES {
+            log::warn!("clipboard text too large, skipping");
+            return;
+        }
+        let Some(clipboard) = self.clipboard.as_mut() else {
+            return;
+        };
+        if let Err(e) = clipboard.set_text(&text) {
+            log::warn!("clipboard write failed: {e}");
         }
     }
 
